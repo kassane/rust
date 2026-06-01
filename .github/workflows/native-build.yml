@@ -1,0 +1,471 @@
+# Build rust-mos toolchain NATIVELY on macOS and Windows (Option A)
+#
+# The Docker flow (.github/workflows/docker-image.yml) only covers Linux
+# (glibc/musl) — Docker can't run native macOS/Windows builds (and arm64 macOS
+# runners have no Docker at all). This workflow adds the native legs:
+#
+#   - macOS arm64 : macos-15      -> aarch64-apple-darwin
+#   - Windows     : windows-2025  -> x86_64-pc-windows-msvc
+#
+# (No x86_64-macos leg by design.)
+#
+# Option A = build llvm-mos FROM SOURCE on each runner (same LLVM_MOS_SHA as the
+# Docker legs => every platform ships the SAME LLVM, and Windows uses the MSVC
+# ABI). Mirrors llvm-mos's own package.yml: git checkout (not a tarball — the llvm
+# monorepo tarball has symlinks bsdtar can't create on Windows) and the
+# `distribution` target (NOT `all` — `all` builds runtimes-mos, whose configure
+# fails on macOS with a LibEdit/SHARED-on-Generic error; `distribution` doesn't).
+#
+# rustc links LLVM via [target].llvm-config pointed at the llvm-mos BUILD TREE
+# (which holds the host LLVM static libs + headers — the standard rustc-dev flow);
+# MOS.cmake's install is toolchain-only, so the install prefix is used only for the
+# clang/lld/mos-* tools shipped in the artifact.
+
+name: Build Native Toolchain
+
+on:
+  workflow_dispatch:
+    inputs:
+      llvm_mos_sha:
+        description: 'llvm-mos commit SHA'
+        required: false
+        type: string
+      llvm_mos_sdk_sha:
+        description: 'llvm-mos-sdk commit SHA'
+        required: false
+        type: string
+      rust_mos_sha:
+        description: 'rust-mos commit SHA (defaults to the checked-out commit)'
+        required: false
+        type: string
+  push:
+    branches: [llvm-mos]
+    paths:
+      - '.github/workflows/native-build.yml'
+
+env:
+  # Keep in sync with .github/workflows/docker-image.yml
+  DEFAULT_LLVM_MOS_SHA: 'c798c31416f72b395c658b5502d281a162387ab1'
+  DEFAULT_LLVM_MOS_SDK_SHA: '95bf367e953f6da89371e18c72791f8a8738fdac'
+
+concurrency:
+  group: native-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            triple: aarch64-apple-darwin
+            llvm_targets: 'AArch64'
+          - os: windows-2025
+            triple: x86_64-pc-windows-msvc
+            llvm_targets: 'X86'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360  # LLVM from source is slow on the first (uncached) run
+    defaults:
+      run:
+        shell: bash       # Git Bash on Windows — uniform scripting across OSes
+
+    steps:
+      - name: Checkout (rust source, no recursive submodules)
+        uses: actions/checkout@main
+        with:
+          submodules: false   # NEVER fetch src/llvm-project — we use external llvm-mos
+
+      # MSVC toolchain (cl.exe / link.exe) for the Windows leg. Sets the VS
+      # environment for all subsequent steps so CMake/Ninja pick up cl, and so
+      # rustc links with the MSVC ABI (x86_64-pc-windows-msvc).
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build tools
+        run: |
+          set -eux
+          if [ "${RUNNER_OS}" = "macOS" ]; then
+            brew install ninja cmake || true   # cmake usually preinstalled
+          elif [ "${RUNNER_OS}" = "Windows" ]; then
+            choco install ninja -y             # cmake preinstalled on windows-2025
+          fi
+          cmake --version
+          ninja --version
+
+      - name: Resolve SHAs and paths
+        id: cfg
+        # Untrusted workflow_dispatch inputs are taken via env (not interpolated
+        # straight into the script) and validated as hex SHAs before any use in
+        # URLs/paths — see github.blog command-injection guidance. All downstream
+        # steps consume the validated steps.cfg.outputs.* (hex only => injection-safe).
+        env:
+          IN_LLVM: ${{ inputs.llvm_mos_sha }}
+          IN_SDK: ${{ inputs.llvm_mos_sdk_sha }}
+          IN_RUST: ${{ inputs.rust_mos_sha }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          set -eux
+          LLVM_SHA="${IN_LLVM:-$DEFAULT_LLVM_MOS_SHA}"
+          SDK_SHA="${IN_SDK:-$DEFAULT_LLVM_MOS_SDK_SHA}"
+          RUST_SHA="${IN_RUST:-$GH_SHA}"
+          for v in "$LLVM_SHA" "$SDK_SHA" "$RUST_SHA"; do
+            [[ "$v" =~ ^[0-9a-fA-F]{7,40}$ ]] || { echo "::error::not a hex SHA: $v"; exit 1; }
+          done
+          echo "llvm=${LLVM_SHA}"  >> "$GITHUB_OUTPUT"
+          echo "sdk=${SDK_SHA}"    >> "$GITHUB_OUTPUT"
+          echo "rust=${RUST_SHA}"  >> "$GITHUB_OUTPUT"
+          # Normalize the workspace path to forward slashes. On Windows
+          # GITHUB_WORKSPACE is "D:\a\rust\rust" (backslashes); embedded verbatim
+          # into bootstrap.toml's llvm-config = "..." it makes invalid TOML escapes
+          # (\a, \r) -> "invalid escape character in string". Forward slashes are
+          # accepted by TOML, by CMake, and by rustc/clang on Windows.
+          WS="${GITHUB_WORKSPACE//\\//}"
+          # Install prefix for the llvm-mos clang/lld/mos-* tools + the SDK (the
+          # artifact's toolchain).
+          echo "prefix=${WS}/mos-toolchain" >> "$GITHUB_OUTPUT"
+          # llvm-mos BUILD tree — holds the host LLVM libs/headers + llvm-config
+          # that rustc links against.
+          echo "build=${WS}/llvm-build" >> "$GITHUB_OUTPUT"
+          # Parallelism: nproc (Linux/Git-Bash) or sysctl (macOS)
+          echo "jobs=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)" >> "$GITHUB_OUTPUT"
+
+      # Cache BOTH the build tree (rustc links it via llvm-config) and the install
+      # prefix (artifact tools). GITHUB_WORKSPACE is stable across runs, so the
+      # build-tree llvm-config's absolute paths stay valid on a cache hit.
+      - name: Cache llvm-mos
+        id: llvmcache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.cfg.outputs.build }}
+            ${{ steps.cfg.outputs.prefix }}
+          # Bump the leading version when the build RECIPE changes (component
+          # list, extra lib targets, flags) so a warm cache from an older recipe
+          # is not reused. The SHAs alone don't capture recipe changes.
+          key: llvm-mos-v4-${{ matrix.triple }}-${{ steps.cfg.outputs.llvm }}-${{ steps.cfg.outputs.sdk }}
+
+      # ALWAYS check out the llvm-mos source (even on a cache hit). MOS.cmake's
+      # install is toolchain-only, so rustc's llvm-config points at the BUILD
+      # tree, whose --includedir references the SOURCE headers
+      # (llvm-mos/llvm/include/...). Those headers are needed when compiling
+      # rustc_llvm (PassWrapper.cpp etc.). On a cache hit the build step below is
+      # skipped, so without this the source tree (and its headers) would be
+      # missing -> "llvm/Support/raw_ostream.h file not found". GITHUB_WORKSPACE
+      # is stable, so re-checking out the same SHA to the same path keeps the
+      # absolute include paths baked into the cached build tree valid.
+      - name: Checkout llvm-mos source (headers for rustc_llvm)
+        run: |
+          set -eux
+          # Shallow git fetch of the pinned SHA (NOT a tarball): the llvm monorepo
+          # tarball contains symlinks (clang/test/Inputs, mlgo-utils) that bsdtar
+          # cannot create on Windows -> "tar: Exiting with failure status". git
+          # checks those out as plain files on Windows (core.symlinks off) and never
+          # fails. Mirrors llvm-mos's own package.yml (actions/checkout).
+          if [ -f llvm-mos/.git_sha ] && \
+             [ "$(cat llvm-mos/.git_sha)" = '${{ steps.cfg.outputs.llvm }}' ]; then
+            echo "llvm-mos source already at the pinned SHA; skipping fetch"
+            exit 0
+          fi
+          rm -rf llvm-mos
+          git init -q llvm-mos
+          git -C llvm-mos remote add origin https://github.com/llvm-mos/llvm-mos.git
+          git -C llvm-mos -c protocol.version=2 fetch -q --depth 1 origin '${{ steps.cfg.outputs.llvm }}'
+          git -C llvm-mos checkout -q FETCH_HEAD
+          echo '${{ steps.cfg.outputs.llvm }}' > llvm-mos/.git_sha
+
+      - name: Build llvm-mos from source
+        if: steps.llvmcache.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          PREFIX='${{ steps.cfg.outputs.prefix }}'
+          BUILD='${{ steps.cfg.outputs.build }}'
+          # Windows: build with the MSVC compiler (matches llvm-mos package.yml).
+          # NOTE: declare empty then append; expand with the ${arr[@]+...} guard
+          # below because bash 3.2 (macOS runners) treats "${EXTRA[@]}" on an empty
+          # array as an unbound variable under `set -u`.
+          EXTRA=()
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            # Build LLVM with the STATIC CRT (/MT). rustc on x86_64-pc-windows-msvc
+            # FORCES crt-static (bootstrap lib.rs:1402-1408 hard-returns Some(true)
+            # for *pc-windows-msvc, and it can't be disabled via bootstrap.toml), so
+            # rust's C++ wrappers (CoverageMappingWrapper.o, ...) compile /MT. If
+            # LLVM is built /MD (the default) linking rustc_driver fails with
+            # LNK2038 'RuntimeLibrary MD_ vs MT_' + unresolved __imp_* CRT externals.
+            # Use CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -- the SAME mechanism
+            # rust's own bootstrap uses (llvm.rs:443). The legacy LLVM_USE_CRT_*
+            # flags are a deprecated CMP0091 shim that is silently dropped, which is
+            # why the previous attempt did not take effect.
+            EXTRA+=(-DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl)
+            EXTRA+=(-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded)
+          fi
+          # MOS.cmake sets the build type, the MOS experimental target and the
+          # distribution component list. We only ADD the host backend (MOS.cmake
+          # leaves LLVM_TARGETS_TO_BUILD empty, but rustc needs the host target to
+          # codegen host code) and a link-job cap (LLVM links are ~4 GB each).
+          # Override LLVM_DISTRIBUTION_COMPONENTS (MOS.cmake's value is a non-FORCE
+          # cache var, so -D wins) to a MINIMAL toolchain: drop the IDE/dev tools
+          # (clangd, clang-tidy, clang-format, clang-scan-deps, clang-refactor,
+          # clang-include-fixer, clang-apply-replacements, find-all-symbols) that
+          # are never used to compile/link MOS code. This trims both build time and
+          # the shipped artifact (clangd alone is ~150 MB). The kept binutils list
+          # mirrors MOS.cmake's LLVM_TOOLCHAIN_TOOLS.
+          DIST='builtins;clang;clang-resource-headers;lld'
+          DIST="${DIST};llvm-addr2line;llvm-ar;llvm-cxxfilt;llvm-dwarfdump;llvm-mc"
+          DIST="${DIST};llvm-mlb;llvm-nm;llvm-objcopy;llvm-objdump;llvm-ranlib"
+          DIST="${DIST};llvm-readelf;llvm-readobj;llvm-size;llvm-strings;llvm-strip;llvm-symbolizer"
+          cmake -G Ninja \
+            -C llvm-mos/clang/cmake/caches/MOS.cmake \
+            -S llvm-mos/llvm \
+            -B "${BUILD}" \
+            -DLLVM_TARGETS_TO_BUILD='${{ matrix.llvm_targets }}' \
+            -DLLVM_DISTRIBUTION_COMPONENTS="${DIST}" \
+            -DLLVM_PARALLEL_LINK_JOBS=2 \
+            -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
+            ${EXTRA[@]+"${EXTRA[@]}"}
+          # Build the 'distribution' target (NOT 'all'): the curated set from
+          # MOS.cmake includes 'builtins' but NOT 'runtimes-mos', whose configure
+          # fails on macOS (LibEdit/SHARED-on-Generic). Also build llvm-config so
+          # rustc can query the host LLVM libs from the build tree.
+          cmake --build "${BUILD}" -j '${{ steps.cfg.outputs.jobs }}' --target distribution
+          cmake --build "${BUILD}" -j '${{ steps.cfg.outputs.jobs }}' --target llvm-config
+          # rustc statically links rustc_driver against the host LLVM. Its
+          # `llvm-config --libs <host>` expands the host component to the FULL set
+          # of that target's libraries, including <host>TargetMCA and the shared
+          # MCA lib -- which 'distribution' (clang/lld only need codegen+asmparser)
+          # does NOT build. Without these, llvm-config errors "missing LLVM*MCA"
+          # and rustc_llvm's build.rs panics. Build them explicitly. (x86_64 hit
+          # this; AArch64 happened to already have them. Warn-don't-fail so a host
+          # lacking a separate TargetMCA library doesn't break the build.)
+          for lib in LLVMMCA 'LLVM${{ matrix.llvm_targets }}TargetMCA'; do
+            cmake --build "${BUILD}" -j '${{ steps.cfg.outputs.jobs }}' --target "${lib}" \
+              || echo "::warning::could not build ${lib} (may not exist for this host)"
+          done
+          # Install clang/lld/mos-* tools into the prefix (artifact toolchain).
+          cmake --build "${BUILD}" --target install-distribution-stripped
+          echo "=== installed llvm-mos prefix size ==="
+          du -sh "${PREFIX}" 2>/dev/null || true
+          du -sh "${PREFIX}"/* 2>/dev/null | sort -rh | head -15 || true
+
+      - name: Build llvm-mos SDK
+        if: steps.llvmcache.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          PREFIX='${{ steps.cfg.outputs.prefix }}'
+          curl -fsSL "https://github.com/llvm-mos/llvm-mos-sdk/archive/${{ steps.cfg.outputs.sdk }}.tar.gz" | tar xz
+          mv "llvm-mos-sdk-${{ steps.cfg.outputs.sdk }}" llvm-mos-sdk
+          # The SDK's top-level project(llvm-mos-sdk LANGUAGES C CXX ASM) runs
+          # HOST compiler detection; it locates the MOS cross compiler separately
+          # via find_mos_compiler (honors -DLLVM_MOS / the install prefix).
+          # On Windows we must NOT put ${PREFIX}/bin first on PATH: CMake would
+          # then pick the MOS clang.exe (defaults to the bare-metal mos target)
+          # as the *host* compiler, and its test link mixes Windows-GNU flags
+          # (--major-image-version, -lkernel32) with MOS defaults (-l:crt0.o,
+          # link.ld) -> "C compiler is broken". Instead point the SDK at the MOS
+          # compiler with -DLLVM_MOS and let CMake detect the real host cl.exe.
+          # On Linux/macOS the system compiler wins host detection regardless, so
+          # we keep the convenient PATH prepend there.
+          SDK_EXTRA=()
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            SDK_EXTRA+=(-DLLVM_MOS="${PREFIX}")
+          else
+            export PATH="${PREFIX}/bin:${PATH}"
+          fi
+          cmake -G Ninja \
+            -S llvm-mos-sdk \
+            -B sdk-build \
+            -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
+            -DLLVM_MOS_BUILD_EXAMPLES=OFF \
+            ${SDK_EXTRA[@]+"${SDK_EXTRA[@]}"}
+          cmake --build sdk-build -j '${{ steps.cfg.outputs.jobs }}'
+          cmake --install sdk-build
+
+      # Only the two submodules rust needs for this build (NOT src/llvm-project).
+      - name: Fetch rust submodules
+        run: |
+          set -eux
+          git submodule update --init --depth 1 library/backtrace src/tools/cargo
+
+      - name: Write bootstrap.toml
+        run: |
+          set -eux
+          BUILD='${{ steps.cfg.outputs.build }}'
+          TRIPLE='${{ matrix.triple }}'
+          # rustc links the HOST LLVM from the build tree (MOS.cmake's install is
+          # toolchain-only, so the prefix has no LLVM libs/headers/llvm-config).
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            LLVM_CONFIG="${BUILD}/bin/llvm-config.exe"
+          else
+            LLVM_CONFIG="${BUILD}/bin/llvm-config"
+          fi
+          cat > bootstrap.toml <<TOML
+          change-id = 137220
+
+          [build]
+          docs = false
+          host = ["${TRIPLE}"]
+          extended = true
+          tools = ["cargo"]
+
+          [rust]
+          # We point llvm-config at the MOS build tree, which builds the
+          # 'distribution' target only (no FileCheck/llvm-cov/llvm-profdata).
+          # codegen-tests: sanity.rs:319 panics if an externally-configured LLVM
+          # lacks FileCheck AND codegen-tests are on. We never run codegen tests
+          # in this toolchain build, so disabling drops that requirement.
+          codegen-tests = false
+          # llvm-tools: compile.rs:2150 copies every LLVM_TOOLS binary (llvm-cov,
+          # llvm-profdata, ...) from the build tree into the sysroot and only
+          # tolerates missing ones under download-ci-llvm. The 'distribution'
+          # target does not build them, so disable shipping llvm-tools-preview
+          # in this cross toolchain (consistent with the trimmed LLVM build).
+          llvm-tools = false
+          # NOTE: we intentionally do NOT set `strip = true`. With llvm-tools=false
+          # there is no `rust-objcopy` in the sysroot, and rustc's strip path shells
+          # out to it ("unable to run rust-objcopy"). We strip post-build with the
+          # system `strip -x` in the assemble step instead, and the real artifact
+          # bloat (hardlink materialization by upload-artifact) is handled by
+          # tarring the toolchain ourselves.
+
+          [target.${TRIPLE}]
+          llvm-config = "${LLVM_CONFIG}"
+          llvm-has-rust-patches = false
+
+          [llvm]
+          download-ci-llvm = false
+
+          [dist]
+          compression-formats = ["gz"]
+          TOML
+          cat bootstrap.toml
+
+      - name: Build rustc + cargo (x.py)
+        # Pass `--stage 1` EXPLICITLY. Bootstrap's CI guard (config.rs) only
+        # asserts `--stage 2` when no stage flag is given AND GITHUB_ACTIONS is
+        # set (the rust-lang managed-CI policy); passing the flag makes
+        # flags_stage = Some(1), so that block is skipped entirely and the assert
+        # never runs. Stage 1 matches our Linux artifacts, which are built in
+        # Docker (GITHUB_ACTIONS not propagated -> default stage 1) and which the
+        # downstream build/<triple>/stage1 steps here also consume.
+        run: |
+          set -eux
+          # Windows: this step runs in Git Bash, whose /usr/bin/link.exe (GNU
+          # coreutils 'link') shadows MSVC's link.exe on PATH, so rustc's linker
+          # invocation fails with "/usr/bin/link: extra operand ...". Remove the
+          # coreutils shim so the MSVC linker (from the dev environment) wins.
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            rm -f /usr/bin/link.exe /usr/bin/link || true
+          fi
+          PYTHON=python3; command -v "$PYTHON" >/dev/null 2>&1 || PYTHON=python
+          "$PYTHON" x.py build --stage 1 --jobs '${{ steps.cfg.outputs.jobs }}'
+
+      - name: Generate MOS target JSONs
+        run: |
+          set -eux
+          PREFIX='${{ steps.cfg.outputs.prefix }}'
+          TRIPLE='${{ matrix.triple }}'
+          PYTHON=python3; command -v "$PYTHON" >/dev/null 2>&1 || PYTHON=python
+          STAGE1="build/${TRIPLE}/stage1"
+          mkdir -p mos-targets
+          # Build a PATH that is safe under Git Bash on Windows: a drive-letter
+          # path like "D:/x/bin" cannot go into a colon-separated PATH (the ":"
+          # after the drive is read as a separator). cygpath -u converts it to
+          # the msys form "/d/x/bin". $(pwd) is already msys-form on Git Bash.
+          PREFIX_BIN="${PREFIX}/bin"
+          command -v cygpath >/dev/null 2>&1 && PREFIX_BIN="$(cygpath -u "${PREFIX_BIN}")"
+          PATH="$(pwd)/${STAGE1}/bin:${PREFIX_BIN}:${PATH}" \
+            "$PYTHON" docker/create_mos_targets.py mos-targets
+          ls mos-targets/
+
+      - name: Assemble toolchain
+        run: |
+          set -eux
+          TRIPLE='${{ matrix.triple }}'
+          STAGE1="build/${TRIPLE}/stage1"
+          TOOLS="build/${TRIPLE}/stage1-tools-bin"
+          OUT="rust-mos-${TRIPLE}"
+          mkdir -p "${OUT}/bin" "${OUT}/lib"
+          # The stage1 sysroot ships rustlib/{src,rustc-src}/rust as SYMLINKS back
+          # into the repo source. cp -a tries to recreate them and fails on Windows
+          # ("cannot create symbolic link ... Too many levels of symbolic links").
+          # We materialize a real rust-src tree from library/ below, so just drop
+          # these source symlinks before copying.
+          rm -f "${STAGE1}/lib/rustlib/src/rust" "${STAGE1}/lib/rustlib/rustc-src/rust" 2>/dev/null || true
+          # stage1 rustc + libs
+          cp -a "${STAGE1}/bin/." "${OUT}/bin/"
+          cp -a "${STAGE1}/lib/." "${OUT}/lib/"
+          # cargo (stage1 tool); .exe suffix on Windows
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            cp "${TOOLS}/cargo.exe" "${OUT}/bin/"
+          else
+            cp "${TOOLS}/cargo" "${OUT}/bin/"
+          fi
+          # rust-src for -Zbuild-std (replace the symlink with a real tree)
+          RUST_SRC="${OUT}/lib/rustlib/src/rust"
+          rm -rf "${RUST_SRC}"
+          mkdir -p "${RUST_SRC}"
+          cp -a library "${RUST_SRC}/"
+          cp Cargo.lock "${RUST_SRC}/"
+          # MOS target JSONs (rust-specific). We deliberately DO NOT bundle the
+          # llvm-mos toolchain (clang/lld/SDK) into this artifact — that is multiple
+          # GB and is exactly what the Linux image keeps SEPARATE: the Docker image
+          # layers rust under /usr/local/rust and llvm-mos under /usr/local. The
+          # native artifact mirrors that: it ships only the rust overlay (rustc,
+          # cargo, std, rust-src, target JSONs); users supply the official llvm-mos
+          # clang/lld release for their OS (the linker referenced by the target
+          # JSONs as mos-<platform>-clang must simply be on PATH).
+          cp -a mos-targets "${OUT}/targets"
+
+          # --- Shrink the artifact -------------------------------------------
+          # Strip symbol tables from the big native binaries/dylibs (NOT .rlib/.a
+          # archives — those need their symbols). MSVC PE output on Windows has no
+          # symbol tables to strip (debug lives in separate PDBs we don't ship),
+          # and Git Bash may lack a working `strip`, so skip Windows.
+          if [ "${RUNNER_OS}" != "Windows" ] && command -v strip >/dev/null 2>&1; then
+            find "${OUT}/bin" -type f -perm -u+x 2>/dev/null \
+              -exec strip -x {} + 2>/dev/null || true
+            find "${OUT}/lib" -type f \
+              \( -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \) 2>/dev/null \
+              -exec strip -x {} + 2>/dev/null || true
+          fi
+          # Report the size breakdown so artifact bloat is diagnosable from logs.
+          echo "=== assembled toolchain size (rust overlay only) ==="
+          du -sh "${OUT}" 2>/dev/null || true
+          echo "--- top-level dirs ---"
+          du -sh "${OUT}"/* "${OUT}"/lib/* 2>/dev/null | sort -rh | head -25 || true
+          echo "--- 30 biggest individual files ---"
+          find "${OUT}" -type f -exec du -h {} + 2>/dev/null | sort -rh | head -30 || true
+
+          # Package as ONE tarball ourselves. actions/upload-artifact@v4 archives
+          # the uploaded tree with `tar --dereference --hard-dereference`, which
+          # MATERIALIZES the rust sysroot's hardlinks (bootstrap hardlinks std /
+          # the driver across lib/ and rustlib/) into full duplicate copies — a
+          # major, silent source of artifact bloat. Tarring ourselves preserves
+          # hardlinks, and uploading a single file gives upload-artifact nothing
+          # to dereference. (gzip keeps it portable across Linux/macOS/Windows tar.)
+          tar -czf "${OUT}.tar.gz" "${OUT}"
+          echo "=== packaged tarball size ==="
+          ls -lh "${OUT}.tar.gz" 2>/dev/null || true
+
+      - name: Upload toolchain artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-mos-${{ matrix.triple }}-${{ steps.cfg.outputs.rust }}
+          path: rust-mos-${{ matrix.triple }}.tar.gz
+          if-no-files-found: error
+
+      # Sanity check: the freshly built rustc runs and knows the MOS target.
+      - name: Smoke test — rustc + MOS target list
+        run: |
+          set -eux
+          TRIPLE='${{ matrix.triple }}'
+          BIN="rust-mos-${TRIPLE}/bin"
+          if [ "${RUNNER_OS}" = "Windows" ]; then RUSTC="${BIN}/rustc.exe"; else RUSTC="${BIN}/rustc"; fi
+          "$RUSTC" --version
+          "$RUSTC" --print target-list | grep -i '^mos-unknown-none$'

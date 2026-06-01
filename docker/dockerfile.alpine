@@ -1,0 +1,321 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# rust-mos toolchain — reproducible build from source (Alpine / musl)
+# =============================================================================
+#
+# Alpine (musl libc) counterpart of docker/dockerfile (Ubuntu / glibc).
+# Multi-stage build of LLVM-MOS, LLVM-MOS SDK, and rust-mos entirely from
+# source. All inputs are pinned for reproducibility.
+#
+# Single-arch build (amd64):
+#   docker buildx build -f docker/dockerfile.alpine \
+#     --tag ghcr.io/kassane/rust-mos:alpine .
+#
+# Override source versions:
+#   docker buildx build -f docker/dockerfile.alpine \
+#     --build-arg LLVM_MOS_SHA=<sha> \
+#     --build-arg RUST_MOS_SHA=<sha> \
+#     --tag ghcr.io/kassane/rust-mos:alpine .
+#
+# For multi-arch builds, see .github/workflows/docker-image.yml
+#
+# musl/Alpine notes vs the Ubuntu image:
+#   - Host triple is *-unknown-linux-musl (not -gnu).
+#   - rustc is built with crt-static=false so it can dynamically load the
+#     codegen backend and proc-macro dylibs (a fully-static rustc cannot).
+#   - busybox `find`/`sha256sum` lack `-executable` / robust `-c`, so the
+#     builder/final stages install findutils + coreutils.
+#   - Alpine ships the Ninja-compatible `samurai`; we resolve the program
+#     explicitly instead of assuming a `ninja` binary name.
+# =============================================================================
+
+# --- Pinned base image ---
+# NOTE: pin a digest for full reproducibility, e.g.
+#   ARG BASE_IMAGE=alpine:3.21@sha256:<digest>
+ARG BASE_IMAGE=alpine:3.21
+
+# --- Pinned source versions (override with --build-arg) ---
+ARG LLVM_MOS_SHA=c798c31416f72b395c658b5502d281a162387ab1
+ARG LLVM_MOS_SDK_SHA=95bf367e953f6da89371e18c72791f8a8738fdac
+ARG RUST_MOS_SHA=86fedace82b163730441949688947a8d8a151a81
+
+# =============================================================================
+# Stage 1: LLVM-MOS + LLVM-MOS SDK
+# =============================================================================
+FROM ${BASE_IMAGE} AS llvm-builder
+
+# Build dependencies
+# - build-base provides gcc/g++/make/binutils/musl-dev
+# - samurai provides a Ninja-compatible build tool
+# - findutils gives GNU `find` (busybox find lacks `-executable`)
+# - zlib-dev/libffi-dev are optional LLVM deps; present => enabled
+RUN --mount=type=cache,target=/var/cache/apk,sharing=locked \
+    apk add --no-cache \
+      build-base cmake samurai ccache git curl ca-certificates \
+      python3 findutils linux-headers \
+      libstdc++ zlib-dev libffi-dev
+
+ARG LLVM_MOS_SHA
+ARG LLVM_MOS_SDK_SHA
+WORKDIR /src
+
+# Download LLVM-MOS source (tarball is much faster than git clone for a 2.6 GB repo)
+RUN curl -fsSL "https://github.com/llvm-mos/llvm-mos/archive/${LLVM_MOS_SHA}.tar.gz" | tar xz && \
+    mv "llvm-mos-${LLVM_MOS_SHA}" llvm-mos
+
+# Build LLVM-MOS
+# - MOS.cmake provides the base config (MOS experimental target, clang, lld, etc.)
+# - We add X86 + AArch64 host targets (needed by rust-mos for host code generation)
+# - LLVM_INSTALL_TOOLCHAIN_ONLY=OFF ensures llvm-config is installed (needed by rust-mos)
+# - LLVM_PARALLEL_LINK_JOBS limits concurrent linker jobs (each needs ~4 GB RAM)
+# - CMAKE_MAKE_PROGRAM is resolved explicitly because Alpine's Ninja is `samu`
+RUN --mount=type=cache,target=/ccache,id=ccache-llvm-alpine \
+    export CCACHE_DIR=/ccache && \
+    NINJA_PROG="$(command -v ninja || command -v samu)" && \
+    cmake -G Ninja \
+      -C llvm-mos/clang/cmake/caches/MOS.cmake \
+      -S llvm-mos/llvm \
+      -B llvm-build \
+      -DCMAKE_MAKE_PROGRAM="${NINJA_PROG}" \
+      -DCMAKE_BUILD_TYPE=MinSizeRel \
+      -DLLVM_HOST_TRIPLE=$(uname -m)-alpine-linux-musl \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+      -DLLVM_TARGETS_TO_BUILD="X86;AArch64" \
+      -DLLVM_INSTALL_TOOLCHAIN_ONLY=OFF \
+      -DLLVM_TOOLCHAIN_UTILITIES=FileCheck \
+      -DLLVM_INSTALL_UTILS=ON \
+      -DLLVM_PARALLEL_LINK_JOBS=2 \
+      -DCMAKE_INSTALL_PREFIX=/usr/local && \
+    cmake --build llvm-build -j"$(nproc)" && \
+    cmake --install llvm-build
+
+# Download and build LLVM-MOS SDK
+RUN curl -fsSL "https://github.com/llvm-mos/llvm-mos-sdk/archive/${LLVM_MOS_SDK_SHA}.tar.gz" | tar xz && \
+    mv "llvm-mos-sdk-${LLVM_MOS_SDK_SHA}" llvm-mos-sdk
+
+RUN NINJA_PROG="$(command -v ninja || command -v samu)" && \
+    cmake -G Ninja \
+      -B sdk-build \
+      -S llvm-mos-sdk \
+      -DCMAKE_MAKE_PROGRAM="${NINJA_PROG}" \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DLLVM_MOS_BUILD_EXAMPLES=OFF && \
+    cmake --build sdk-build -j"$(nproc)" && \
+    cmake --install sdk-build
+
+# Strip debug symbols from installed binaries
+RUN find /usr/local -type f \( -executable -o -name '*.so*' \) \
+      -exec strip --strip-unneeded {} + 2>/dev/null || true
+
+# =============================================================================
+# Stage 2: rust-mos
+# =============================================================================
+FROM llvm-builder AS rust-builder
+
+ARG RUST_MOS_SHA
+
+# Additional build dependencies for rust / cargo
+# - openssl-dev + openssl-libs-static + pkgconf let cargo's openssl-sys link
+#   against system OpenSSL statically on musl (see OPENSSL_STATIC below)
+# - bash is used by some build scripts; python3 already present from stage 1
+# - libunwind-dev provides libunwind.a in case the musl std build links it
+#   directly (native Alpine usually unwinds via gcc/libgcc, but this is cheap
+#   insurance against a "couldn't find libunwind" link failure)
+RUN --mount=type=cache,target=/var/cache/apk,sharing=locked \
+    apk add --no-cache \
+      openssl-dev openssl-libs-static pkgconf bash git \
+      libunwind-dev
+
+WORKDIR /src
+
+# Download rust source
+RUN curl -fsSL "https://github.com/kassane/rust/archive/${RUST_MOS_SHA}.tar.gz" | tar xz && \
+    mv "rust-${RUST_MOS_SHA}" rust
+
+# Fetch required submodules (not included in GitHub tarballs)
+# Resolves each submodule's pinned SHA via the git protocol (git ls-tree on a
+# shallow, no-checkout fetch), then downloads its tarball. We deliberately AVOID
+# the GitHub REST API (contents endpoint): unauthenticated calls are rate-limited
+# to 60/hr per source IP, and CI runners share egress IPs, so amd64 builds
+# intermittently got HTTP 403 -> empty SHA -> 404 on the archive. The git smart-
+# HTTP protocol has no such limit, so this is reliable on every architecture.
+ARG RUST_MOS_REPO=kassane/rust
+RUN cd /src && \
+    git init -q rust-meta && cd rust-meta && \
+    git remote add origin "https://github.com/${RUST_MOS_REPO}" && \
+    git fetch -q --depth 1 origin "${RUST_MOS_SHA}" && \
+    for submod in \
+      "library/backtrace rust-lang/backtrace-rs" \
+      "src/tools/cargo rust-lang/cargo" \
+    ; do \
+      path="${submod%% *}" repo="${submod##* }"; \
+      sha=$(git ls-tree FETCH_HEAD "${path}" | awk '{print $3}'); \
+      if [ -z "${sha}" ]; then echo "!!! could not resolve submodule SHA for ${path}" >&2; exit 1; fi; \
+      echo ">>> Fetching submodule ${path} at ${sha} from ${repo}"; \
+      mkdir -p "/src/rust/${path}" && \
+      curl -fsSL "https://github.com/${repo}/archive/${sha}.tar.gz" | tar xz --strip-components=1 -C "/src/rust/${path}"; \
+    done && \
+    cd /src && rm -rf rust-meta
+
+# musl builds need source from src/llvm-project that the GitHub tarball omits:
+#   - CrtBeginEnd  -> compiler-rt/lib/builtins/{crtbegin,crtend}.c
+#   - Libunwind    -> libunwind/{src,include}  (builds libunwind.a)
+# Both steps are hardcoded for every musl target (needs_crt_begin_end) and call
+# require_submodule. Instead of fetching that multi-GB submodule, symlink it to the
+# llvm-mos monorepo already present from stage 1 (it contains compiler-rt/ and
+# libunwind/). LLVM itself is NOT rebuilt from these sources: [target] llvm-config
+# points at the prebuilt install, so bootstrap short-circuits the LLVM build
+# (prebuilt_llvm_config -> AlreadyBuilt).
+RUN rm -rf /src/rust/src/llvm-project && \
+    ln -s /src/llvm-mos /src/rust/src/llvm-project
+
+# Generate config.toml for the native host architecture (musl)
+# - crt-static = false: a statically-linked rustc cannot dlopen the codegen
+#   backend / proc-macro dylibs, so we link the compiler dynamically against musl.
+RUN HOST_TRIPLE="$(uname -m)-unknown-linux-musl" && \
+    cat > /src/rust/config.toml << TOML
+change-id = 137220
+
+[build]
+build-dir = "/tmp/rust-build"
+docs = false
+host = ["${HOST_TRIPLE}"]
+extended = true
+tools = ["cargo"]
+
+[target.${HOST_TRIPLE}]
+llvm-config = "/usr/local/bin/llvm-config"
+llvm-has-rust-patches = false
+crt-static = false
+
+[rust]
+# Alpine's proven config (also bootstrap's default) — be explicit.
+lld = false
+
+[llvm]
+download-ci-llvm = false
+# Stage-1 LLVM is built as static archives; link it statically into rustc.
+link-shared = false
+# Statically absorb libstdc++ (the C++ runtime that static-LLVM pulls in) so the
+# toolchain doesn't depend on the host's libstdc++.so.6. A fully-static rustc is
+# impossible (codegen backend + proc-macros are dlopen'd .so's, rejected under
+# crt-static on musl — #110511/#71651), but the C++ stdlib CAN be static.
+static-libstdcpp = true
+
+[dist]
+compression-formats = ["gz"]
+TOML
+
+# Build rust (stage1 compiler + tools)
+# OPENSSL_STATIC=1 so cargo's openssl-sys links the static system OpenSSL on musl.
+# LIBZ_SYS_STATIC=1 so cargo's libz-sys links static zlib (no libz.so.1 dep).
+# (libgcc_s.so.1 + musl libc stay dynamic: musl libc is required dynamic for the
+#  dlopen'd codegen/proc-macro backends, and libgcc_s ships in Alpine's base.)
+RUN --mount=type=cache,target=/tmp/rust-build/cache,id=rust-build-cache-alpine \
+    cd /src/rust && \
+    export OPENSSL_STATIC=1 OPENSSL_DIR=/usr LIBZ_SYS_STATIC=1 && \
+    python3 x.py build --jobs "$(nproc)"
+
+# Collect artifacts into /rust-install
+RUN set -eux && \
+    HOST_TRIPLE="$(uname -m)-unknown-linux-musl" && \
+    STAGE1="/tmp/rust-build/${HOST_TRIPLE}/stage1" && \
+    TOOLS="/tmp/rust-build/${HOST_TRIPLE}/stage1-tools-bin" && \
+    mkdir -p /rust-install/bin /rust-install/lib && \
+    # stage1 compiler
+    cp -a "${STAGE1}/bin/"* /rust-install/bin/ && \
+    cp -a "${STAGE1}/lib/"* /rust-install/lib/ && \
+    # cargo (built separately as a stage1 tool)
+    cp "${TOOLS}/cargo" /rust-install/bin/cargo && \
+    # rust-src: needed for -Zbuild-std cross-compilation to MOS targets
+    # stage1/lib/rustlib/src/rust is a symlink back to /src/rust (the build tree);
+    # replace it with a real directory containing library/ and Cargo.lock
+    RUST_SRC_DEST="/rust-install/lib/rustlib/src/rust" && \
+    rm -rf "${RUST_SRC_DEST}" && \
+    mkdir -p "${RUST_SRC_DEST}" && \
+    cp -a /src/rust/library "${RUST_SRC_DEST}/" && \
+    cp /src/rust/Cargo.lock "${RUST_SRC_DEST}/" && \
+    # Strip debug symbols
+    find /rust-install -type f \( -executable -o -name '*.so*' \) \
+      -exec strip --strip-unneeded {} + 2>/dev/null || true
+
+# Generate MOS target JSON definitions
+# Requires: rustc (stage1) + mos-*-clang (SDK) on PATH
+RUN set -eux && \
+    HOST_TRIPLE="$(uname -m)-unknown-linux-musl" && \
+    STAGE1="/tmp/rust-build/${HOST_TRIPLE}/stage1" && \
+    mkdir -p /mos-targets && \
+    PATH="${STAGE1}/bin:/usr/local/bin:${PATH}" \
+      python3 /src/rust/docker/create_mos_targets.py /mos-targets && \
+    ls /mos-targets/
+
+# =============================================================================
+# Stage 3: Final runtime image
+# =============================================================================
+FROM ${BASE_IMAGE} AS final
+
+ARG LLVM_MOS_SHA
+ARG LLVM_MOS_SDK_SHA
+ARG RUST_MOS_SHA
+
+LABEL org.opencontainers.image.base.name="alpine:3.21" \
+      org.opencontainers.image.source="https://github.com/kassane/rust" \
+      org.opencontainers.image.description="rust toolchain built from source on Alpine/musl (LLVM-MOS + SDK + rust)"
+
+# Minimal runtime + host compilation deps (gcc/make/musl-dev for cargo build scripts).
+# findutils + coreutils provide GNU `find -executable` and `sha256sum -c`.
+# bash is the login shell referenced below.
+RUN apk add --no-cache \
+      libstdc++ zlib ca-certificates curl \
+      gcc make musl-dev \
+      bash findutils coreutils
+
+# LLVM-MOS + SDK (clang, lld, llvm-*, mos-platform, per-platform .cfg + symlinks)
+COPY --chmod=755 --from=llvm-builder /usr/local/bin/ /usr/local/bin/
+COPY --from=llvm-builder /usr/local/lib/ /usr/local/lib/
+COPY --from=llvm-builder /usr/local/include/ /usr/local/include/
+COPY --from=llvm-builder /usr/local/share/ /usr/local/share/
+COPY --from=llvm-builder /usr/local/mos-platform/ /usr/local/mos-platform/
+COPY --from=llvm-builder /usr/local/libexec/ /usr/local/libexec/
+
+# rust (rustc, cargo, clippy, rustfmt + libs)
+COPY --chmod=755 --from=rust-builder /rust-install/bin/ /usr/local/rust/bin/
+COPY --from=rust-builder /rust-install/lib/ /usr/local/rust/lib/
+
+# MOS target definitions
+COPY --from=rust-builder /mos-targets/ /usr/local/rust/targets/
+ENV RUST_TARGET_PATH=/usr/local/rust/targets
+
+# Lock down toolchain permissions — root-owned, not world-writable
+RUN find /usr/local -type f -executable -exec chmod 755 {} + && \
+    find /usr/local -type f ! -executable -exec chmod 644 {} + && \
+    find /usr/local -type d -exec chmod 755 {} + && \
+    chown -R root:root /usr/local
+
+# Non-root user (no sudo). Alpine ships busybox adduser/addgroup.
+ARG USERNAME=mos
+ARG USER_UID=1000
+ARG USER_GID=1000
+RUN addgroup -g $USER_GID $USERNAME && \
+    adduser -u $USER_UID -G $USERNAME -s /bin/bash -D $USERNAME
+
+USER $USERNAME
+WORKDIR /home/$USERNAME
+
+# Install rustup from pinned version with checksum verification (no curl|sh)
+# Architecture-neutral: downloads the right musl binary and verifies the checksum
+ARG RUSTUP_VERSION=1.29.0
+RUN set -eux; \
+    HOST="$(uname -m)-unknown-linux-musl" && \
+    BASE_URL="https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${HOST}" && \
+    curl --proto '=https' --tlsv1.2 -sSfL "${BASE_URL}/rustup-init" -o /tmp/rustup-init && \
+    curl --proto '=https' --tlsv1.2 -sSfL "${BASE_URL}/rustup-init.sha256" -o /tmp/rustup-init.sha256 && \
+    cd /tmp && sha256sum -c rustup-init.sha256 && \
+    chmod +x rustup-init && \
+    ./rustup-init -y --default-toolchain none --no-modify-path && \
+    rm rustup-init rustup-init.sha256
+
+ENV PATH=/home/mos/.cargo/bin:/usr/local/rust/bin:/usr/local/bin:${PATH}
+RUN rustup toolchain link mos /usr/local/rust && rustup default mos
+RUN echo "RUST_TARGET_PATH=$RUST_TARGET_PATH" >> $HOME/.bashrc

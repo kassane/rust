@@ -41,9 +41,21 @@ extern crate core;
 #[macro_use]
 mod macros;
 
+// MOS (6502): the llvm-mos-sdk supplies soft-float (compiler-rt: `__mulsf3`/`__addsf3`/…) and
+// 6502-optimized mem* routines, so drop compiler-builtins' `float` and `mem` for MOS — the SDK
+// provides both (verified: f32/f64 arithmetic links to a valid program). The `math` (libm)
+// intrinsic wrappers are gated off in math/mod.rs because the llvm-mos backend can't legalize
+// the f64 libm range reduction (`G_FPTOSI_SAT`) or fmod's i128 `NarrowingDiv`, and f16/f128.
+// NOTE: unlike float/mem, the SDK does NOT provide libm — its `libm.a` is an empty stub and
+// `<math.h>` declares no sin/cos/sqrt — so transcendentals and float `%` are simply unavailable
+// on no_std MOS (calling one is an `undefined symbol: fmodf` link error, confirmed empirically).
+// That is acceptable: `core` exposes no transcendentals anyway (`f32::sqrt` etc. are std-only).
+// `int` and `math::libm_math::support` (needed by `int`/`mem`) are kept.
+#[cfg(not(target_arch = "mos"))]
 pub mod float;
 pub mod int;
 pub mod math;
+#[cfg(not(target_arch = "mos"))]
 pub mod mem;
 pub mod sync;
 

@@ -8,6 +8,9 @@ pub(crate) mod feature_detect;
 mod float_traits;
 pub mod hex_float;
 mod int_traits;
+// MOS (6502): `modular` uses i128 big-int division (NarrowingDiv) the llvm-mos backend
+// can't legalize (G_UREM s128); it's only used by libm fns we don't emit for MOS.
+#[cfg(not(target_arch = "mos"))]
 mod modular;
 
 #[allow(unused_imports)]
@@ -27,7 +30,13 @@ pub use hex_float::hf16;
 pub use hex_float::hf128;
 #[allow(unused_imports)]
 pub use hex_float::{DisplayHex, Hex, hf32, hf64};
+#[cfg(not(target_arch = "mos"))]
 pub use int_traits::{CastFrom, CastInto, DInt, HInt, Int, MinInt, NarrowingDiv};
+// MOS (6502): drop NarrowingDiv/modular re-exports — they instantiate i128 division the
+// llvm-mos backend can't legalize. int/mem only use the basic integer traits below.
+#[cfg(target_arch = "mos")]
+pub use int_traits::{CastFrom, CastInto, DInt, HInt, Int, MinInt};
+#[cfg(not(target_arch = "mos"))]
 pub use modular::linear_mul_reduction;
 
 /// Hint to the compiler that the current path is cold.

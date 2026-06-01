@@ -22,6 +22,7 @@ const OPTIONAL_COMPONENTS: &[&str] = &[
     "systemz",
     "webassembly",
     "msp430",
+    "mos",
     "sparc",
     "nvptx",
     "hexagon",

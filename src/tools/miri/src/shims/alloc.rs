@@ -50,6 +50,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             arch @ (Arch::AmdGpu
             | Arch::Avr
             | Arch::Bpf
+            | Arch::Mos
             | Arch::Msp430
             | Arch::Nvptx64
             | Arch::SpirV

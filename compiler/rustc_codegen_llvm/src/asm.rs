@@ -286,6 +286,10 @@ impl<'ll, 'tcx> AsmBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                 InlineAsmArch::M68k => {
                     constraints.push("~{ccr}".to_string());
                 }
+                InlineAsmArch::Mos => {
+                    // The 6502 processor status flags (carry/zero/negative/etc.).
+                    constraints.push("~{cc}".to_string());
+                }
                 InlineAsmArch::CSKY => {
                     constraints.push("~{psr}".to_string());
                 }
@@ -767,6 +771,8 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'_>>) ->
             M68k(M68kInlineAsmRegClass::reg) => "r",
             M68k(M68kInlineAsmRegClass::reg_addr) => "a",
             M68k(M68kInlineAsmRegClass::reg_data) => "d",
+            Mos(MosInlineAsmRegClass::reg) => "r",
+            Mos(MosInlineAsmRegClass::reg_gpr) => "R",
             CSKY(CSKYInlineAsmRegClass::reg) => "r",
             CSKY(CSKYInlineAsmRegClass::freg) => "f",
             SpirV(SpirVInlineAsmRegClass::reg) => bug!("LLVM backend does not support SPIR-V"),
@@ -867,6 +873,7 @@ fn modifier_to_llvm(
         Msp430(_) => None,
         SpirV(SpirVInlineAsmRegClass::reg) => bug!("LLVM backend does not support SPIR-V"),
         M68k(_) => None,
+        Mos(_) => None,
         CSKY(_) => None,
         Err => unreachable!(),
     }
@@ -971,6 +978,8 @@ fn dummy_output_type<'ll>(cx: &CodegenCx<'ll, '_>, reg: InlineAsmRegClass) -> &'
         M68k(M68kInlineAsmRegClass::reg) => cx.type_i32(),
         M68k(M68kInlineAsmRegClass::reg_addr) => cx.type_i32(),
         M68k(M68kInlineAsmRegClass::reg_data) => cx.type_i32(),
+        Mos(MosInlineAsmRegClass::reg) => cx.type_i8(),
+        Mos(MosInlineAsmRegClass::reg_gpr) => cx.type_i8(),
         CSKY(CSKYInlineAsmRegClass::reg) => cx.type_i32(),
         CSKY(CSKYInlineAsmRegClass::freg) => cx.type_f32(),
         SpirV(SpirVInlineAsmRegClass::reg) => bug!("LLVM backend does not support SPIR-V"),

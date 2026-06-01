@@ -604,6 +604,7 @@ fn human_readable_target_arch(os: Symbol) -> Option<&'static str> {
         Mips32r6 => "MIPS release 6",
         Mips64 => "MIPS-64",
         Mips64r6 => "MIPS-64 release 6",
+        Mos => "MOS 6502",
         Msp430 => "MSP430",
         Nvptx64 => "NVidia GPU",
         PowerPC => "PowerPC",

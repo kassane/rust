@@ -20,6 +20,9 @@ mod fmaximum_num;
 mod fmin;
 mod fminimum;
 mod fminimum_num;
+// MOS (6502): fmod is the only libm fn using i128 NarrowingDiv (G_UREM s128), which the
+// llvm-mos backend can't legalize; gate it off — the llvm-mos-sdk provides fmod.
+#[cfg(not(target_arch = "mos"))]
 mod fmod;
 mod frexp;
 mod ilogb;
@@ -42,6 +45,7 @@ pub use fmaximum_num::fmaximum_num;
 pub use fmin::fmin;
 pub use fminimum::fminimum;
 pub use fminimum_num::fminimum_num;
+#[cfg(not(target_arch = "mos"))]
 pub use fmod::fmod;
 pub use frexp::frexp;
 pub use ilogb::ilogb;

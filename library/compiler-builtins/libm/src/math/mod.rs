@@ -148,6 +148,8 @@ mod fma;
 mod fmin_fmax;
 mod fminimum_fmaximum;
 mod fminimum_fmaximum_num;
+// MOS (6502): fmod uses i128 NarrowingDiv the llvm-mos backend can't legalize; SDK provides it.
+#[cfg(not(target_arch = "mos"))]
 mod fmod;
 mod frexp;
 mod hypot;
@@ -241,6 +243,7 @@ pub use self::fma::{fma, fmaf};
 pub use self::fmin_fmax::{fmax, fmaxf, fmin, fminf};
 pub use self::fminimum_fmaximum::{fmaximum, fmaximumf, fminimum, fminimumf};
 pub use self::fminimum_fmaximum_num::{fmaximum_num, fmaximum_numf, fminimum_num, fminimum_numf};
+#[cfg(not(target_arch = "mos"))]
 pub use self::fmod::{fmod, fmodf};
 pub use self::frexp::{frexp, frexpf};
 pub use self::hypot::hypot;
@@ -308,6 +311,7 @@ cfg_if! {
         pub use self::fmin_fmax::{fmaxf16, fminf16};
         pub use self::fminimum_fmaximum::{fmaximumf16, fminimumf16};
         pub use self::fminimum_fmaximum_num::{fmaximum_numf16, fminimum_numf16};
+        #[cfg(not(target_arch = "mos"))]
         pub use self::fmod::fmodf16;
         pub use self::frexp::frexpf16;
         pub use self::ilogb::ilogbf16;
@@ -334,6 +338,7 @@ cfg_if! {
         pub use self::fmin_fmax::{fmaxf128, fminf128};
         pub use self::fminimum_fmaximum::{fmaximumf128, fminimumf128};
         pub use self::fminimum_fmaximum_num::{fmaximum_numf128, fminimum_numf128};
+        #[cfg(not(target_arch = "mos"))]
         pub use self::fmod::fmodf128;
         pub use self::frexp::frexpf128;
         pub use self::ilogb::ilogbf128;

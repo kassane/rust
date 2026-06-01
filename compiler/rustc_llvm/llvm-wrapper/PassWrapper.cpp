@@ -91,7 +91,8 @@ extern "C" void LLVMRustTimeTraceProfilerFinish(const char *FileName) {
 extern "C" bool LLVMRustHasFeature(LLVMTargetMachineRef TM,
                                    const char *Feature) {
   TargetMachine *Target = unwrap(TM);
-#if LLVM_VERSION_GE(23, 0)
+// llvm-mos keeps the pointer-returning getMCSubtargetInfo() despite reporting LLVM >= 23
+#if LLVM_VERSION_GE(23, 0) && !defined(LLVM_COMPONENT_MOS)
   const MCSubtargetInfo &MCInfo = Target->getMCSubtargetInfo();
 #else
   const MCSubtargetInfo &MCInfo = *Target->getMCSubtargetInfo();
@@ -278,7 +279,8 @@ static llvm::DebugCompressionType fromRust(LLVMRustCompressionKind Kind) {
 extern "C" void LLVMRustPrintTargetCPUs(LLVMTargetMachineRef TM,
                                         RustStringRef OutStr) {
   ArrayRef<SubtargetSubTypeKV> CPUTable =
-#if LLVM_VERSION_GE(23, 0)
+// llvm-mos keeps the pointer-returning getMCSubtargetInfo() despite reporting LLVM >= 23
+#if LLVM_VERSION_GE(23, 0) && !defined(LLVM_COMPONENT_MOS)
       unwrap(TM)->getMCSubtargetInfo().getAllProcessorDescriptions();
 #else
       unwrap(TM)->getMCSubtargetInfo()->getAllProcessorDescriptions();
@@ -294,7 +296,8 @@ extern "C" void LLVMRustPrintTargetCPUs(LLVMTargetMachineRef TM,
 
 extern "C" size_t LLVMRustGetTargetFeaturesCount(LLVMTargetMachineRef TM) {
   const TargetMachine *Target = unwrap(TM);
-#if LLVM_VERSION_GE(23, 0)
+// llvm-mos keeps the pointer-returning getMCSubtargetInfo() despite reporting LLVM >= 23
+#if LLVM_VERSION_GE(23, 0) && !defined(LLVM_COMPONENT_MOS)
   const MCSubtargetInfo &MCInfo = Target->getMCSubtargetInfo();
 #else
   const MCSubtargetInfo &MCInfo = *Target->getMCSubtargetInfo();
@@ -308,7 +311,8 @@ extern "C" void LLVMRustGetTargetFeature(LLVMTargetMachineRef TM, size_t Index,
                                          const char **Feature,
                                          const char **Desc) {
   const TargetMachine *Target = unwrap(TM);
-#if LLVM_VERSION_GE(23, 0)
+// llvm-mos keeps the pointer-returning getMCSubtargetInfo() despite reporting LLVM >= 23
+#if LLVM_VERSION_GE(23, 0) && !defined(LLVM_COMPONENT_MOS)
   const MCSubtargetInfo &MCInfo = Target->getMCSubtargetInfo();
 #else
   const MCSubtargetInfo &MCInfo = *Target->getMCSubtargetInfo();
@@ -1503,7 +1507,11 @@ extern "C" void LLVMRustComputeLTOCacheKey(RustStringRef KeyOut,
   DenseSet<GlobalValue::GUID> CfiFunctionDecls;
 
   // Based on the 'InProcessThinBackend' constructor in LLVM
-#if LLVM_VERSION_GE(23, 0)
+  // NOTE: llvm-mos is an LLVM 23 fork that predates CfiFunctionIndex::
+  // getExportedThinLTOGUIDs(), so exclude it via !defined(LLVM_COMPONENT_MOS)
+  // (same convention as the other LLVM_VERSION_GE(23,0) guards in this file) and
+  // fall back to the .symbols() path below, which the MOS fork still has.
+#if LLVM_VERSION_GE(23, 0) && !defined(LLVM_COMPONENT_MOS)
   CfiFunctionDefs.insert_range(
       Data->Index.cfiFunctionDefs().getExportedThinLTOGUIDs());
   CfiFunctionDecls.insert_range(

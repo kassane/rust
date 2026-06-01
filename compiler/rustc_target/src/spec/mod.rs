@@ -1668,6 +1668,8 @@ supported_targets! {
 
     ("msp430-none-elf", msp430_none_elf),
 
+    ("mos-unknown-none", mos_unknown_none),
+
     ("aarch64_be-unknown-hermit", aarch64_be_unknown_hermit),
     ("aarch64-unknown-hermit", aarch64_unknown_hermit),
     ("riscv64gc-unknown-hermit", riscv64gc_unknown_hermit),
@@ -1891,6 +1893,7 @@ crate::target_spec_enum! {
         Mips32r6 = "mips32r6",
         Mips64 = "mips64",
         Mips64r6 = "mips64r6",
+        Mos = "mos",
         Msp430 = "msp430",
         Nvptx64 = "nvptx64",
         PowerPC = "powerpc",
@@ -1928,6 +1931,7 @@ impl Arch {
             Self::Mips32r6 => sym::mips32r6,
             Self::Mips64 => sym::mips64,
             Self::Mips64r6 => sym::mips64r6,
+            Self::Mos => sym::mos,
             Self::Msp430 => sym::msp430,
             Self::Nvptx64 => sym::nvptx64,
             Self::PowerPC => sym::powerpc,
@@ -1954,7 +1958,7 @@ impl Arch {
         match self {
             AArch64 | RiscV32 | RiscV64 => true,
             AmdGpu | Arm | Arm64EC | Avr | Bpf | CSky | Hexagon | LoongArch32 | LoongArch64
-            | M68k | Mips | Mips32r6 | Mips64 | Mips64r6 | Msp430 | Nvptx64 | PowerPC
+            | M68k | Mips | Mips32r6 | Mips64 | Mips64r6 | Mos | Msp430 | Nvptx64 | PowerPC
             | PowerPC64 | S390x | Sparc | Sparc64 | SpirV | Wasm32 | Wasm64 | X86 | X86_64
             | Xtensa | Other(_) => false,
         }
@@ -2231,7 +2235,7 @@ impl Target {
             // - Check that calling c-variadic functions defined in Rust can be called from C.
             // For most targets `tests/run-make/c-link-to-rust-va-list-fn` can be used here.
             // For no_std targets a manual setup may be needed.
-            Sparc | Avr | M68k | Msp430 => {
+            Sparc | Avr | M68k | Msp430 | Mos => {
                 CVariadicStatus::Unstable { feature: sym::c_variadic_experimental_arch }
             }
 
@@ -3846,6 +3850,7 @@ impl Target {
             | Arch::SpirV
             | Arch::Wasm32
             | Arch::Wasm64
+            | Arch::Mos
             | Arch::Other(_) => return None,
         })
     }

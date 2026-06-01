@@ -19,6 +19,12 @@ macro_rules! libm_intrinsics {
 
 /// This set of functions is well tested in `libm` and known to provide similar performance to
 /// system `libm`, as well as the same or better accuracy.
+// MOS (6502): the llvm-mos backend cannot legalize the f32/f64 math these intrinsics emit
+// (e.g. `G_FPTOSI_SAT` in libm range reduction), so the libm intrinsic wrappers are dropped.
+// (The SDK does NOT supply libm — `libm.a` is a stub — so transcendentals are unavailable on
+// no_std MOS; that's fine, `core` exposes none.) `libm_math` (and its `support` submodule,
+// needed by `int`/`mem`) stays available — only the intrinsic wrappers are dropped.
+#[cfg(not(target_arch = "mos"))]
 pub mod full_availability {
     #[cfg(f16_enabled)]
     libm_intrinsics! {
@@ -130,6 +136,8 @@ pub mod full_availability {
 ///     - <https://github.com/rust-lang/rust/issues/128533>
 /// - All unix targets (linux, macos, freebsd, android, etc)
 /// - wasm with known target_os
+/// - MOS (6502): the llvm-mos backend cannot legalize this f64 math (`G_FPTOSI_SAT` / i128);
+///   the SDK provides no libm fallback (`libm.a` is a stub), so it stays unavailable on no_std.
 #[cfg(not(any(
     all(
         target_arch = "x86",
@@ -137,6 +145,7 @@ pub mod full_availability {
         not(target_os = "uefi"),
     ),
     unix,
+    target_arch = "mos",
     all(target_family = "wasm", not(target_os = "unknown"))
 )))]
 pub mod partial_availability {

@@ -21,6 +21,7 @@ mod loongarch;
 mod m68k;
 mod mips;
 mod mips64;
+mod mos;
 mod msp430;
 mod nvptx64;
 mod powerpc;
@@ -696,6 +697,7 @@ impl<'a, Ty> FnAbi<'a, Ty> {
             Arch::AmdGpu => amdgpu::compute_abi_info(cx, self),
             Arch::Arm => arm::compute_abi_info(cx, self),
             Arch::Avr => avr::compute_abi_info(cx, self),
+            Arch::Mos => mos::compute_abi_info(cx, self),
             Arch::LoongArch32 | Arch::LoongArch64 => loongarch::compute_abi_info(cx, self),
             Arch::M68k => m68k::compute_abi_info(cx, self),
             Arch::CSky => csky::compute_abi_info(cx, self),

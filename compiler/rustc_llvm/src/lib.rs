@@ -184,6 +184,14 @@ pub fn initialize_available_targets() {
         LLVMInitializeMSP430AsmParser
     );
     init_target!(
+        llvm_component = "mos",
+        LLVMInitializeMOSTargetInfo,
+        LLVMInitializeMOSTarget,
+        LLVMInitializeMOSTargetMC,
+        LLVMInitializeMOSAsmPrinter,
+        LLVMInitializeMOSAsmParser
+    );
+    init_target!(
         llvm_component = "riscv",
         LLVMInitializeRISCVTargetInfo,
         LLVMInitializeRISCVTarget,

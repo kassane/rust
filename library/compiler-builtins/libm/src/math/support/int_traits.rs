@@ -1,6 +1,10 @@
 use core::{cmp, fmt, ops};
 
+// MOS (6502): narrowing_div is i128 big-int division (G_UREM s128) the llvm-mos backend
+// can't legalize; only used by libm fns not emitted for MOS.
+#[cfg(not(target_arch = "mos"))]
 mod narrowing_div;
+#[cfg(not(target_arch = "mos"))]
 pub use narrowing_div::NarrowingDiv;
 
 use crate::support::DisplayHex;

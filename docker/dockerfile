@@ -1,0 +1,264 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# rust-mos toolchain — reproducible build from source
+# =============================================================================
+#
+# Multi-stage Dockerfile that builds LLVM-MOS, LLVM-MOS SDK, and rust-mos
+# entirely from source. All inputs are pinned for reproducibility.
+#
+# Single-arch build (amd64):
+#   docker buildx build -f docker/Dockerfile.build \
+#     --tag ghcr.io/kassane/rust-mos:latest .
+#
+# Override source versions:
+#   docker buildx build -f docker/Dockerfile.build \
+#     --build-arg LLVM_MOS_SHA=<sha> \
+#     --build-arg RUST_MOS_SHA=<sha> \
+#     --tag ghcr.io/kassane/rust-mos:latest .
+#
+# For multi-arch builds, see .github/workflows/docker-image.yml
+# =============================================================================
+
+# --- Pinned base image ---
+ARG BASE_IMAGE=ubuntu:24.04@sha256:d1e2e92c075e5ca139d51a140fff46f84315c0fdce203eab2807c7e495eff4f9
+
+# --- Pinned source versions (override with --build-arg) ---
+ARG LLVM_MOS_SHA=c798c31416f72b395c658b5502d281a162387ab1
+ARG LLVM_MOS_SDK_SHA=95bf367e953f6da89371e18c72791f8a8738fdac
+ARG RUST_MOS_SHA=86fedace82b163730441949688947a8d8a151a81
+
+# =============================================================================
+# Stage 1: LLVM-MOS + LLVM-MOS SDK
+# =============================================================================
+FROM ${BASE_IMAGE} AS llvm-builder
+
+# Build dependencies
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
+      build-essential cmake ninja-build ccache git curl ca-certificates \
+      python3 libstdc++-13-dev
+
+ARG LLVM_MOS_SHA
+ARG LLVM_MOS_SDK_SHA
+WORKDIR /src
+
+# Download LLVM-MOS source (tarball is much faster than git clone for a 2.6 GB repo)
+RUN curl -fsSL "https://github.com/llvm-mos/llvm-mos/archive/${LLVM_MOS_SHA}.tar.gz" | tar xz && \
+    mv "llvm-mos-${LLVM_MOS_SHA}" llvm-mos
+
+# Build LLVM-MOS
+# - MOS.cmake provides the base config (MOS experimental target, clang, lld, etc.)
+# - We add X86 + AArch64 host targets (needed by rust-mos for host code generation)
+# - LLVM_INSTALL_TOOLCHAIN_ONLY=OFF ensures llvm-config is installed (needed by rust-mos)
+# - LLVM_PARALLEL_LINK_JOBS limits concurrent linker jobs (each needs ~4 GB RAM)
+RUN --mount=type=cache,target=/ccache,id=ccache-llvm \
+    export CCACHE_DIR=/ccache && \
+    cmake -G Ninja \
+      -C llvm-mos/clang/cmake/caches/MOS.cmake \
+      -S llvm-mos/llvm \
+      -B llvm-build \
+      -DCMAKE_BUILD_TYPE=MinSizeRel \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+      -DLLVM_TARGETS_TO_BUILD="X86;AArch64" \
+      -DLLVM_INSTALL_TOOLCHAIN_ONLY=OFF \
+      -DLLVM_TOOLCHAIN_UTILITIES=FileCheck \
+      -DLLVM_INSTALL_UTILS=ON \
+      -DLLVM_PARALLEL_LINK_JOBS=2 \
+      -DCMAKE_INSTALL_PREFIX=/usr/local && \
+    cmake --build llvm-build -j"$(nproc)" && \
+    cmake --install llvm-build
+
+# Download and build LLVM-MOS SDK
+RUN curl -fsSL "https://github.com/llvm-mos/llvm-mos-sdk/archive/${LLVM_MOS_SDK_SHA}.tar.gz" | tar xz && \
+    mv "llvm-mos-sdk-${LLVM_MOS_SDK_SHA}" llvm-mos-sdk
+
+RUN cmake -G Ninja \
+      -B sdk-build \
+      -S llvm-mos-sdk \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DLLVM_MOS_BUILD_EXAMPLES=OFF && \
+    cmake --build sdk-build -j"$(nproc)" && \
+    cmake --install sdk-build
+
+# Strip debug symbols from installed binaries
+RUN find /usr/local -type f \( -executable -o -name '*.so*' \) \
+      -exec strip --strip-unneeded {} + 2>/dev/null || true
+
+# =============================================================================
+# Stage 2: rust-mos
+# =============================================================================
+FROM llvm-builder AS rust-builder
+
+ARG RUST_MOS_SHA
+
+# Additional build dependencies for rust
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
+      libssl-dev pkg-config git
+
+WORKDIR /src
+
+# Download rust source
+RUN curl -fsSL "https://github.com/kassane/rust/archive/${RUST_MOS_SHA}.tar.gz" | tar xz && \
+    mv "rust-${RUST_MOS_SHA}" rust
+
+# Fetch required submodules (not included in GitHub tarballs)
+# Resolves each submodule's pinned SHA via the git protocol (git ls-tree on a
+# shallow, no-checkout fetch), then downloads its tarball. We deliberately AVOID
+# the GitHub REST API (contents endpoint): unauthenticated calls are rate-limited
+# to 60/hr per source IP, and CI runners share egress IPs, so amd64 builds
+# intermittently got HTTP 403 -> empty SHA -> 404 on the archive. The git smart-
+# HTTP protocol has no such limit, so this is reliable on every architecture.
+ARG RUST_MOS_REPO=kassane/rust
+RUN cd /src && \
+    git init -q rust-meta && cd rust-meta && \
+    git remote add origin "https://github.com/${RUST_MOS_REPO}" && \
+    git fetch -q --depth 1 origin "${RUST_MOS_SHA}" && \
+    for submod in \
+      "library/backtrace rust-lang/backtrace-rs" \
+      "src/tools/cargo rust-lang/cargo" \
+    ; do \
+      path="${submod%% *}" repo="${submod##* }"; \
+      sha=$(git ls-tree FETCH_HEAD "${path}" | awk '{print $3}'); \
+      if [ -z "${sha}" ]; then echo "!!! could not resolve submodule SHA for ${path}" >&2; exit 1; fi; \
+      echo ">>> Fetching submodule ${path} at ${sha} from ${repo}"; \
+      mkdir -p "/src/rust/${path}" && \
+      curl -fsSL "https://github.com/${repo}/archive/${sha}.tar.gz" | tar xz --strip-components=1 -C "/src/rust/${path}"; \
+    done && \
+    cd /src && rm -rf rust-meta
+
+# Generate config.toml for the native host architecture
+RUN HOST_TRIPLE="$(uname -m)-unknown-linux-gnu" && \
+    cat > /src/rust/config.toml << TOML
+change-id = 137220
+
+[build]
+build-dir = "/tmp/rust-build"
+docs = false
+host = ["${HOST_TRIPLE}"]
+extended = true
+tools = ["cargo"]
+
+[target.${HOST_TRIPLE}]
+llvm-config = "/usr/local/bin/llvm-config"
+llvm-has-rust-patches = false
+
+[llvm]
+download-ci-llvm = false
+
+[dist]
+compression-formats = ["gz"]
+TOML
+
+# Build rust (stage1 compiler + tools)
+RUN --mount=type=cache,target=/tmp/rust-build/cache,id=rust-build-cache \
+    cd /src/rust && python3 x.py build --jobs "$(nproc)"
+
+# Collect artifacts into /rust-install
+RUN set -eux && \
+    HOST_TRIPLE="$(uname -m)-unknown-linux-gnu" && \
+    STAGE1="/tmp/rust-build/${HOST_TRIPLE}/stage1" && \
+    TOOLS="/tmp/rust-build/${HOST_TRIPLE}/stage1-tools-bin" && \
+    mkdir -p /rust-install/bin /rust-install/lib && \
+    # stage1 compiler
+    cp -a "${STAGE1}/bin/"* /rust-install/bin/ && \
+    cp -a "${STAGE1}/lib/"* /rust-install/lib/ && \
+    # cargo (built separately as a stage1 tool)
+    cp "${TOOLS}/cargo" /rust-install/bin/cargo && \
+    # rust-src: needed for -Zbuild-std cross-compilation to MOS targets
+    # stage1/lib/rustlib/src/rust is a symlink back to /src/rust (the build tree);
+    # replace it with a real directory containing library/ and Cargo.lock
+    RUST_SRC_DEST="/rust-install/lib/rustlib/src/rust" && \
+    rm -rf "${RUST_SRC_DEST}" && \
+    mkdir -p "${RUST_SRC_DEST}" && \
+    cp -a /src/rust/library "${RUST_SRC_DEST}/" && \
+    cp /src/rust/Cargo.lock "${RUST_SRC_DEST}/" && \
+    # Strip debug symbols
+    find /rust-install -type f \( -executable -o -name '*.so*' \) \
+      -exec strip --strip-unneeded {} + 2>/dev/null || true
+
+# Generate MOS target JSON definitions
+# Requires: rustc (stage1) + mos-*-clang (SDK) on PATH
+RUN set -eux && \
+    HOST_TRIPLE="$(uname -m)-unknown-linux-gnu" && \
+    STAGE1="/tmp/rust-build/${HOST_TRIPLE}/stage1" && \
+    mkdir -p /mos-targets && \
+    PATH="${STAGE1}/bin:/usr/local/bin:${PATH}" \
+      python3 /src/rust/docker/create_mos_targets.py /mos-targets && \
+    ls /mos-targets/
+
+# =============================================================================
+# Stage 3: Final runtime image
+# =============================================================================
+FROM ${BASE_IMAGE} AS final
+
+ARG LLVM_MOS_SHA
+ARG LLVM_MOS_SDK_SHA
+ARG RUST_MOS_SHA
+
+LABEL org.opencontainers.image.base.name="ubuntu:24.04" \
+      org.opencontainers.image.base.digest="sha256:d1e2e92c075e5ca139d51a140fff46f84315c0fdce203eab2807c7e495eff4f9" \
+      org.opencontainers.image.source="https://github.com/kassane/rust" \
+      org.opencontainers.image.description="rust toolchain built from source (LLVM-MOS + SDK + rust)"
+
+# Minimal runtime + host compilation deps (gcc/make for cargo build scripts)
+RUN apt-get update && \
+    apt-get install --no-install-recommends -y \
+      libstdc++6 zlib1g ca-certificates curl \
+      gcc make libc6-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# LLVM-MOS + SDK (clang, lld, llvm-*, mos-platform, per-platform .cfg + symlinks)
+COPY --chmod=755 --from=llvm-builder /usr/local/bin/ /usr/local/bin/
+COPY --from=llvm-builder /usr/local/lib/ /usr/local/lib/
+COPY --from=llvm-builder /usr/local/include/ /usr/local/include/
+COPY --from=llvm-builder /usr/local/share/ /usr/local/share/
+COPY --from=llvm-builder /usr/local/mos-platform/ /usr/local/mos-platform/
+COPY --from=llvm-builder /usr/local/libexec/ /usr/local/libexec/
+
+# rust (rustc, cargo, clippy, rustfmt + libs)
+COPY --chmod=755 --from=rust-builder /rust-install/bin/ /usr/local/rust/bin/
+COPY --from=rust-builder /rust-install/lib/ /usr/local/rust/lib/
+
+# MOS target definitions
+COPY --from=rust-builder /mos-targets/ /usr/local/rust/targets/
+ENV RUST_TARGET_PATH=/usr/local/rust/targets
+
+# Lock down toolchain permissions — root-owned, not world-writable
+RUN find /usr/local -type f -executable -exec chmod 755 {} + && \
+    find /usr/local -type f ! -executable -exec chmod 644 {} + && \
+    find /usr/local -type d -exec chmod 755 {} + && \
+    chown -R root:root /usr/local
+
+# Non-root user (no sudo)
+ARG USERNAME=mos
+ARG USER_UID=1000
+ARG USER_GID=1000
+RUN userdel --remove "$(id -nu $USER_UID)" 2>/dev/null || true && \
+    groupadd --force --gid $USER_GID $USERNAME && \
+    useradd --uid $USER_UID --gid $USER_GID -m $USERNAME -s /bin/bash
+
+USER $USERNAME
+WORKDIR /home/$USERNAME
+
+# Install rustup from pinned version with checksum verification (no curl|sh)
+# Architecture-neutral: downloads the right binary and verifies against CDN-provided checksum
+ARG RUSTUP_VERSION=1.29.0
+RUN set -eux; \
+    HOST="$(uname -m)-unknown-linux-gnu" && \
+    BASE_URL="https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${HOST}" && \
+    curl --proto '=https' --tlsv1.2 -sSfL "${BASE_URL}/rustup-init" -o /tmp/rustup-init && \
+    curl --proto '=https' --tlsv1.2 -sSfL "${BASE_URL}/rustup-init.sha256" -o /tmp/rustup-init.sha256 && \
+    cd /tmp && sha256sum -c rustup-init.sha256 && \
+    chmod +x rustup-init && \
+    ./rustup-init -y --default-toolchain none --no-modify-path && \
+    rm rustup-init rustup-init.sha256
+
+ENV PATH=/home/mos/.cargo/bin:/usr/local/rust/bin:/usr/local/bin:${PATH}
+RUN rustup toolchain link mos /usr/local/rust && rustup default mos
+RUN echo "RUST_TARGET_PATH=$RUST_TARGET_PATH" >> $HOME/.bashrc
